@@ -53,7 +53,7 @@ class EnhancedNewsScraper:
             'https://www.engadget.com/rss.xml',
             
             # 综合新闻源
-            'https://rss.CNN.com/rss/edition.rss',
+            'https://rss.cnn.com/rss/edition.rss',
             'https://feeds.bbci.co.uk/news/rss.xml',
         ]
         
@@ -148,8 +148,7 @@ class EnhancedNewsScraper:
                                 }
                                 
                                 # 添加到对应分类
-                                for category in categories
-
+                                for category in categories:  # 修复语法错误
                                     self.articles_by_category[category].append(article_data)
                                 
                                 logger.info(f"🎯 获取相关文章: [{','.join(categories)}] {title[:40]}...")
@@ -484,8 +483,7 @@ class EnhancedNewsScraper:
                 for i, article in enumerate(articles, 1):
                     clean_title = article['title'].strip()
                     if len(clean_title) > 70:
-                        clean_title = clean_title[:70] + "..."
-                    
+                        clean_title = clean_title[:70] + "                         
                     html_content += f"""
             <div class="article-item">
                 <div class="article-title">{i}. <a href="{article['url']}" target="_blank">{clean_title}</a></div>
