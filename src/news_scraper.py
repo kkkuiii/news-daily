@@ -1,4 +1,6 @@
-import newspaper
+import requests
+from bs4 import BeautifulSoup
+import feedparser
 from datetime import datetime
 import time
 import logging
@@ -8,6 +10,8 @@ from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from email.header import Header
 import sys
+from urllib.parse import urljoin, urlparse
+import re
 
 # DeepSeek 集成
 from openai import OpenAI
@@ -28,22 +32,42 @@ EMAIL_CONFIG = {
     'receiver_email': os.getenv('RECEIVER_EMAIL', ''),
 }
 
-class NewsScraper:
+class EnhancedNewsScraper:
     def __init__(self, deepseek_api_key: str = None):
-        # 新闻源配置
-        self.news_sources = [
-            'https://www.36kr.com',
-            'https://www.pingwest.com',
-            'https://www.jiqizhixin.com',
-            'https://www.wired.com',
-            'https://techcrunch.com',
+        # 完整的新闻源配置 - 国内外结合
+        self.rss_sources = [
+            # 国内科技新闻源
+            'https://36kr.com/feed',
+            'https://www.pingwest.com/feed',
+            'https://www.jiqizhixin.com/rss',
+            'https://www.leiphone.com/rss',
+            'https://tech.sina.com.cn/rss/index.shtml',
+            'https://tech.qq.com/web/rss_xml.htm',
+            'https://www.geekpark.net/rss',
+            
+            # 国外科技新闻源
+            'https://www.wired.com/feed/rss',
+            'https://techcrunch.com/feed/',
+            'https://www.theverge.com/rss/index.xml',
+            'https://arstechnica.com/feed/',
+            'https://www.engadget.com/rss.xml',
+            
+            # 综合新闻源
+            'https://rss.CNN.com/rss/edition.rss',
+            'https://feeds.bbci.co.uk/news/rss.xml',
         ]
         
-        # 分类配置
+        # 完整的分类配置（保持原样）
         self.categories = {
-            '科技': ['technology', 'tech', '科技', '数码', '互联网', '软件', '硬件'],
-            'AI': ['ai', 'artificial intelligence', '人工智能', '机器学习', '深度学习', '算法'],
-            '医疗': ['health', 'medical', '医疗', '健康', '医院', '疾病'],
+            '科技': ['technology', 'tech', '科技', '数码', '互联网', '软件', '硬件', '创新', 'startup', 'digital', 'internet'],
+            '金融': ['finance', 'financial', '金融', '股市', '银行', '投资', '经济', 'market', 'economy', 'stock', 'banking'],
+            'AI': ['ai', 'artificial intelligence', '人工智能', '机器学习', '深度学习', '算法', 'ml', 'neural', 'chatgpt', '大模型'],
+            '教育': ['education', 'educational', '教育', '学校', '大学', '学习', '培训', 'edu', 'university', 'school'],
+            '医疗': ['health', 'medical', '医疗', '健康', '医院', '疾病', '药物', 'medicine', 'hospital', 'doctor'],
+            '环保': ['environment', 'climate', '环保', '环境', '气候变化', '可持续', 'green', 'sustainability', 'carbon', 'eco'],
+            '汽车': ['car', 'auto', '汽车', '电动车', '电动汽车', 'tesla', 'ev', 'vehicle'],
+            '游戏': ['game', 'gaming', '游戏', '电竞', '电子竞技', 'playstation', 'xbox'],
+            '区块链': ['blockchain', 'crypto', '区块链', '加密货币', '比特币', 'ethereum', 'nft'],
         }
         
         # 存储结果
@@ -62,109 +86,118 @@ class NewsScraper:
             except Exception as e:
                 logger.error(f"❌ DeepSeek API 客户端初始化失败: {e}")
     
-    def get_news_source(self, source_url: str) -> newspaper.Source:
-        """获取新闻源"""
-        try:
-            config = {
-                'memoize_articles': False,
-                'request_timeout': 15,
-                'browser_user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-            }
-            
-            source = newspaper.build(source_url, **config)
-            logger.info(f"✅ 成功加载新闻源: {source_url} (文章数: {len(source.articles)})")
-            return source
-        except Exception as e:
-            logger.error(f"❌ 加载新闻源失败 {source_url}: {e}")
-            return None
-    
-    def is_article_relevant(self, article) -> tuple:
-        """检查文章是否包含关键词"""
-        try:
-            if article.url in self.processed_urls:
-                return False, []
-            
-            self.processed_urls.add(article.url)
-            
-            article.download()
-            if not article.download_state == 2:
-                return False, []
-                
-            article.parse()
-            
-            title = article.title.lower() if article.title else ""
-            text = article.text.lower() if article.text else ""
-            content = title + " " + text[:1000]
-            
-            if len(content) < 30:
-                return False, []
-            
-            relevant_categories = []
-            
-            for category, keywords in self.categories.items():
-                match_score = 0
-                for keyword in keywords:
-                    if keyword.lower() in content:
-                        match_score += 1
-                        if keyword.lower() in title:
-                            match_score += 2
-                
-                threshold = 1 if keyword.lower() in title else 2
-                if match_score >= threshold:
-                    relevant_categories.append(category)
-            
-            return len(relevant_categories) > 0, relevant_categories
-            
-        except Exception as e:
-            logger.debug(f"处理文章时出错: {e}")
-            return False, []
-    
-    def scrape_news(self, max_articles_per_source: int = 6):
-        """抓取新闻"""
+    def fetch_news_from_rss(self):
+        """从RSS源获取新闻"""
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+        }
+        
         successful_sources = 0
-        total_processed = 0
+        total_articles = 0
         
-        for source_url in self.news_sources:
-            logger.info(f"📡 正在处理新闻源: {source_url}")
-            
-            source = self.get_news_source(source_url)
-            if not source or len(source.articles) == 0:
-                logger.warning(f"⚠️ 新闻源 {source_url} 没有可处理的文章")
-                continue
-            
-            articles_to_process = source.articles[:max_articles_per_source]
-            processed_count = 0
-            
-            for article in articles_to_process:
-                try:
-                    is_relevant, categories = self.is_article_relevant(article)
-                    
-                    if is_relevant:
-                        article_data = {
-                            'title': article.title.strip() if article.title else "无标题",
-                            'url': article.url,
-                            'publish_date': article.publish_date,
-                            'summary': (article.summary[:150] + "...") if article.summary else ""
-                        }
-                        
-                        for category in categories:
-                            if not any(a['url'] == article.url for a in self.articles_by_category[category]):
-                                self.articles_by_category[category].append(article_data)
-                        
-                        logger.info(f"🎯 找到相关文章: {article.title[:50]}...")
-                        processed_count += 1
-                        total_processed += 1                     
-                    time.sleep(0.2)
-                    
-                except Exception as e:
-                    logger.debug(f"处理文章时出错 {article.url}: {e}")
+        for rss_url in self.rss_sources:
+            try:
+                logger.info(f"📡 正在处理RSS源: {rss_url}")
+                
+                # 使用 feedparser 解析 RSS
+                feed = feedparser.parse(rss_url, request_headers=headers)
+                
+                if feed.bozo and feed.bozo_exception:
+                    logger.warning(f"⚠️ RSS源可能有问题 {rss_url}: {feed.bozo_exception}")
+                
+                if not feed.entries:
+                    logger.warning(f"⚠️ RSS源没有内容 {rss_url}")
                     continue
-            
-            if processed_count > 0:
-                successful_sources += 1
-            logger.info(f"📊 从 {source_url} 处理了 {processed_count} 篇相关文章")
+                
+                # 处理文章条目
+                entries_processed = 0
+                for entry in feed.entries[:8]:  # 每个源最多处理8篇文章
+                    try:
+                        # 提取文章信息
+                        title = getattr(entry, 'title', '无标题')
+                        link = getattr(entry, 'link', '')
+                        summary = getattr(entry, 'summary', '')
+                        description = getattr(entry, 'description', '')
+                        
+                        # 合并摘要和描述
+                        content = (summary or description or '')[:300]
+                        
+                        # 发布时间
+                        pub_date = None
+                        if hasattr(entry, 'published'):
+                            pub_date = entry.published
+                        elif hasattr(entry, 'updated'):
+                            pub_date = entry.updated
+                        
+                        # 去重检查
+                        if link in self.processed_urls:
+                            continue
+                        self.processed_urls.add(link)
+                        
+                        if link and title:
+                            # 分类文章
+                            is_relevant, categories = self.categorize_article(title, content)
+                            
+                            if is_relevant:
+                                article_data = {
+                                    'title': title.strip(),
+                                    'url': link.strip(),
+                                    'summary': content + "..." if content else "",
+                                    'publish_date': pub_date,
+                                    'source': urlparse(rss_url).netloc
+                                }
+                                
+                                # 添加到对应分类
+                                for category in categories
+
+                                    self.articles_by_category[category].append(article_data)
+                                
+                                logger.info(f"🎯 获取相关文章: [{','.join(categories)}] {title[:40]}...")
+                                entries_processed += 1
+                                total_articles += 1
+                                
+                    except Exception as e:
+                        logger.debug(f"处理RSS条目时出错: {e}")
+                        continue
+                
+                if entries_processed > 0:
+                    successful_sources += 1
+                    logger.info(f"📊 从 {rss_url} 处理了 {entries_processed} 篇相关文章")
+                        
+            except Exception as e:
+                logger.error(f"❌ 处理RSS源失败 {rss_url}: {e}")
+                continue
         
-        logger.info(f"📈 总结: 处理了 {successful_sources} 个新闻源，共找到 {total_processed} 篇相关文章")
+        logger.info(f"📈 总结: 处理了 {successful_sources} 个RSS源，共获取 {total_articles} 篇相关文章")
+    
+    def categorize_article(self, title: str, content: str = "") -> tuple:
+        """对文章进行分类（保持原有逻辑）"""
+        full_content = (title + " " + content).lower()
+        
+        relevant_categories = []
+        match_scores = {}
+        
+        # 计算每个分类的匹配分数
+        for category, keywords in self.categories.items():
+            score = 0
+            for keyword in keywords:
+                keyword_lower = keyword.lower()
+                if keyword_lower in full_content:
+                    score += 1
+                    # 标题中的关键词权重更高
+                    if keyword_lower in title.lower():
+                        score += 2
+            
+            match_scores[category] = score
+        
+        # 根据分数确定相关分类
+        for category, score in match_scores.items():
+            # 设置不同的阈值
+            threshold = 1 if any(keyword.lower() in title.lower() for keyword in self.categories[category]) else 2
+            if score >= threshold:
+                relevant_categories.append(category)
+        
+        return len(relevant_categories) > 0, relevant_categories
     
     def remove_duplicates(self):
         """去除重复文章"""
@@ -184,66 +217,101 @@ class NewsScraper:
         total_after = sum(len(articles) for articles in self.articles_by_category.values())
         logger.info(f"🗑️ 去重完成: {total_before} → {total_after} 篇文章")
     
+    def scrape_news(self):
+        """抓取新闻"""
+        logger.info("🌐 开始从RSS源获取新闻...")
+        self.fetch_news_from_rss()
+        
+        # 去重
+        self.remove_duplicates()
+        
+        logger.info("📈 新闻获取完成")
+    
     def generate_daily_summary(self) -> str:
-        """使用 DeepSeek 生成今日新闻摘要"""
+        """生成今日新闻摘要（使用完整分类）"""
         if not self.deepseek_client:
-            return "⚠️ 未配置 DeepSeek API，无法生成智能摘要。"
+            return self._generate_simple_summary()
         
         try:
+            # 收集所有文章标题
             all_titles = []
             category_stats = {}
             
             for category, articles in self.articles_by_category.items():
                 if articles:
                     category_stats[category] = len(articles)
-                    for article in articles[:6]:
+                    for article in articles[:6]:  # 每个分类最多取6篇文章
                         all_titles.append(f"[{category}] {article['title']}")
             
             if not all_titles:
-                return "📰 今日暂无相关新闻内容。"
+                return "今日导览摘要：今日暂无相关新闻内容。"
             
-            titles_text = "\n".join(all_titles[:30])
+            # 准备数据
+            titles_text = "\n".join(all_titles[:40])  # 最多40篇文章
             stats_text = ", ".join([f"{cat}:{count}篇" for cat, count in category_stats.items()])
             
             prompt = f"""
-            请基于以下今日新闻标题，生成一段300-400字的中文摘要。要求：
+            请基于以下今日新闻标题，生成一段300-500字的中文摘要。要求：
             1. 不要机械复述标题，要进行概括与串联
-            2. 提炼出当日新闻的主要趋势、关注焦点
+            2. 提炼出当日新闻的主要趋势、关注焦点或舆论动向
             3. 风格自然流畅，具有整体感
             4. 突出最重要的几个主题方向
+            5. 可以适当分析各领域的发展态势
+            6. 以专业但易懂的语言表达
             
             今日新闻统计：{stats_text}
             
             新闻标题列表：
             {titles_text}
             
-            请以"今日导览摘要："开头，直接输出摘要内容。
+            请以"今日导览摘要："开头，直接输出摘要内容，不要包含其他说明文字。
             """
             
-            logger.info("🤖 正在调用 DeepSeek 生成智能摘要...")
+            logger.info("🤖 调用 DeepSeek 生成摘要...")
             
             response = self.deepseek_client.chat.completions.create(
                 model="deepseek-chat",
                 messages=[
-                    {"role": "system", "content": "你是一位专业的新闻分析师，擅长总结和分析新闻趋势。"},
+                    {"role": "system", "content": "你是一位专业的新闻分析师和科技观察者，擅长总结和分析新闻趋势。"},
                     {"role": "user", "content": prompt},
                 ],
                 stream=False,
                 temperature=0.7,
-                max_tokens=600
+                max_tokens=800
             )
             
             summary = response.choices[0].message.content.strip()
             if not summary.startswith("今日导览摘要："):
                 summary = "今日导览摘要：" + summary
             
-            logger.info("✅ DeepSeek 摘要生成成功")
+            logger.info("✅ 摘要生成成功")
             return summary
             
         except Exception as e:
-            error_msg = f"❌ DeepSeek 摘要生成失败: {e}"
-            logger.error(error_msg)
-            return "今日导览摘要：由于系统原因，暂无法生成智能摘要。"
+            logger.error(f"❌ 摘要生成失败: {e}")
+            return self._generate_simple_summary()
+    
+    def _generate_simple_summary(self) -> str:
+        """生成简单摘要"""
+        # 统计分类
+        category_stats = {}
+        total_articles = 0
+        
+        for category, articles in self.articles_by_category.items():
+            if articles:
+                count = len(articles)
+                category_stats[category] = count
+                total_articles += count
+        
+        if total_articles == 0:
+            return "今日导览摘要：今日暂无相关新闻内容。"
+        
+        # 按数量排序
+        sorted_categories = sorted(category_stats.items(), key=lambda x: x[1], reverse=True)
+        main_categories = sorted_categories[:4]
+        category_text = "、".join([f"{cat}({count}篇)" for cat, count in main_categories])
+        
+        return f"今日导览摘要：今日共收录{total_articles}篇新闻，主要涉及{category_text}等领域。各领域发展态势良好，值得关注。"
     
     def generate_html_report(self) -> str:
         """生成HTML格式的日报"""
@@ -252,9 +320,6 @@ class NewsScraper:
         
         # 生成摘要
         daily_summary = self.generate_daily_summary()
-        
-        # 去重
-        self.remove_duplicates()
         
         # 按文章数量排序分类
         category_article_counts = [(cat, len(articles)) for cat, articles in self.articles_by_category.items() if articles]
@@ -278,7 +343,7 @@ class NewsScraper:
             color: #333;
         }}
         .container {{
-            max-width: 800px;
+            max-width: 1000px;
             margin: 0 auto;
             background: white;
             padding: 30px;
@@ -301,34 +366,44 @@ class NewsScraper:
         }}
         .summary {{
             background-color: #fff8e1;
-            padding: 20px;
+            padding: 25px;
             border-radius: 8px;
             margin-bottom: 30px;
             border-left: 4px solid #ffc107;
         }}
+        .summary h2 {{
+            margin-top: 0;
+            color: #2c3e50;
+        }}
         .category {{
             background-color: #f8f9fa;
-            padding: 20px;
+            padding: 25px;
             border-radius: 8px;
-            margin-bottom: 20px;
+            margin-bottom: 25px;
+            box-shadow: 0 1px 3px rgba(0,0,0,0.1);
         }}
         .category h2 {{
             margin-top: 0;
             color: #2c3e50;
-            border-bottom: 1px solid #eee;
-            padding-bottom: 10px;
+            border-bottom: 2px solid #eee;
+            padding-bottom: 15px;
         }}
         .article-item {{
-            margin: 15px 0;
-            padding: 15px;
+            margin: 20px 0;
+            padding: 20px;
             background: white;
             border-radius: 6px;
-            box-shadow: 0 1px 3px rgba(0,0,0,0.1);
+            box-shadow: 0 1px 3px rgba(0,0,0,0.05);
+            transition: transform 0.2s ease;
+        }}
+        .article-item:hover {{
+            transform: translateY(-2px);
+            box-shadow: 0 2px 8px rgba(0,0,0,0.15);
         }}
         .article-title {{
-            font-size: 16px;
+            font-size: 17px;
             font-weight: 600;
-            margin: 0 0 8px 0;
+            margin: 0 0 10px 0;
         }}
         .article-title a {{
             color: #3498db;
@@ -338,36 +413,43 @@ class NewsScraper:
             text-decoration: underline;
         }}
         .article-meta {{
-            font-size: 12px;
+            font-size: 13px;
             color: #7f8c8d;
-            margin: 5px 0;
+            margin: 8px 0;
         }}
         .article-summary {{
-            font-size: 13px;
+            font-size: 14px;
             color: #555;
-            margin: 8px 0 0 0;
-            line-height: 1.5;
+            margin: 12px 0 0 0;
+            line-height: 1.6;
         }}
         .stats {{
             background-color: #e8f4f8;
-            padding: 15px;
+            padding: 20px;
             border-radius: 8px;
-            margin-top: 30px;
+            margin-top: 40px;
+        }}
+        .stats h2 {{
+            margin-top: 0;
+            color: #2c3e50;
         }}
         footer {{
             text-align: center;
-            margin-top: 30px;
-            padding-top: 20px;
+            margin-top: 40px;
+            padding-top: 25px;
             border-top: 1px solid #eee;
             color: #7f8c8d;
-            font-size: 12px;
+            font-size: 13px;
         }}
-        @media (max-width: 600px) {{
+        @media (max-width: 768px) {{
             .container {{
                 padding: 15px;
             }}
             .article-title {{
-                font-size: 14px;
+                font-size: 15px;
+            }}
+            .article-summary {{
+                font-size: 13px;
             }}
         }}
     </style>
@@ -388,6 +470,7 @@ class NewsScraper:
         
         """
         
+        # 显示文章（按分类）
         has_content = False
         for category, count in category_article_counts:
             articles = self.articles_by_category[category]
@@ -395,13 +478,13 @@ class NewsScraper:
                 has_content = True
                 html_content += f"""
         <div class="category">
-            <h2>�? {category} ({count}篇)</h2>
+            <h2>📂 {category} ({count}篇)</h2>
                 """
                 
                 for i, article in enumerate(articles, 1):
-                    clean_title = article['title'].replace('[', '').replace(']', '').strip()
-                    if len(clean_title) > 60:
-                        clean_title = clean_title[:60] + "..."
+                    clean_title = article['title'].strip()
+                    if len(clean_title) > 70:
+                        clean_title = clean_title[:70] + "..."
                     
                     html_content += f"""
             <div class="article-item">
@@ -409,13 +492,15 @@ class NewsScraper:
                 """
                     
                     if article.get('publish_date'):
-                        pub_date = article['publish_date']
-                        if isinstance(pub_date, str):
-                            html_content += f'<div class="article-meta">🕐 发布时间: {pub_date}</div>\n'
-                        elif hasattr(pub_date, 'strftime'):
-                            html_content += f'<div class="article-meta">🕐 发布时间: {pub_date.strftime("%Y-%m-%d %H:%M")}</div>\n'
+                        # 简化日期显示
+                        pub_date_str = str(article['publish_date'])
+                        if len(pub_date_str) > 16:
+                            pub_date_str = pub_date_str[:16]
+                        html_content += f'<div class="article-meta">🕐 发布时间: {pub_date_str} | 📰 来源: {article["source"]}</div>\n'
+                    else:
+                        html_content += f'<div class="article-meta">📰 来源: {article["source"]}</div>\n'
                     
-                    if article.get('summary') and len(article['summary']) > 10:
+                    if article.get('summary') and len(article['summary']) > 15:
                         html_content += f'<div class="article-summary">📝 摘要: {article["summary"]}</div>\n'
                     
                     html_content += '            </div>\n'
@@ -435,13 +520,20 @@ class NewsScraper:
         html_content += f"""
         <div class="stats">
             <h2>📊 详细统计</h2>
-            <p>- 总文章数: {total_articles}</p>
-            <p>- 涉及分类: {len([cat for cat, count in category_article_counts if count > 0])}</p>
-            <p>- 处理新闻源: {len(self.news_sources)}</p>
+            <p><strong>总文章数:</strong> {total_articles}</p>
+            <p><strong>涉及分类:</strong> {len([cat for cat, count in category_article_counts if count > 0])}</p>
+            <p><strong>处理新闻源:</strong> {len(self.rss_sources)}</p>
+            """
+        
+        for category, count in category_article_counts:
+            if count > 0:
+                html_content += f"<p>- {category}: {count}篇</p>\n"
+        
+        html_content += """
         </div>
         
         <footer>
-            <p>📊 新闻日报自动生成 | 🕐 生成时间: {current_time} | 🤖 Powered by DeepSeek AI</p>
+            <p>📊 新闻日报自动生成 | 🕐 生成时间: """ + current_time + """ | 🤖 Powered by DeepSeek AI</p>
         </footer>
     </div>
 </body>
@@ -459,7 +551,8 @@ class EmailSender:
         if not config:
             config = EMAIL_CONFIG
         
-        if not all([config['sender_email'], config['sender_password'], config['receiver_email']]):
+        required_fields = ['sender_email', 'sender_password', 'receiver_email']
+        if not all(config.get(field) for field in required_fields):
             logger.error("❌ 邮件配置不完整")
             return False
         
@@ -501,8 +594,13 @@ def main():
     SENDER_PASSWORD = os.getenv('SENDER_PASSWORD')
     RECEIVER_EMAIL = os.getenv('RECEIVER_EMAIL')
     
-    if not all([DEEPSEEK_API_KEY, SENDER_EMAIL, SENDER_PASSWORD, RECEIVER_EMAIL]):
-        logger.error("❌ 环境变量配置不完整，请检查 GitHub Secrets 设置")
+    # 验证必要配置
+    if not DEEPSEEK_API_KEY:
+        logger.error("❌ 请设置 DEEPSEEK_API_KEY 环境变量")
+        sys.exit(1)
+    
+    if not all([SENDER_EMAIL, SENDER_PASSWORD, RECEIVER_EMAIL]):
+        logger.error("❌ 请设置完整的邮件配置环境变量")
         sys.exit(1)
     
     # 更新邮件配置
@@ -515,15 +613,20 @@ def main():
     
     try:
         # 创建新闻抓取器
-        scraper = NewsScraper(deepseek_api_key=DEEPSEEK_API_KEY)
+        scraper = EnhancedNewsScraper(deepseek_api_key=DEEPSEEK_API_KEY)
         
         # 开始抓取新闻
         logger.info("🌐 开始抓取新闻...")
-        scraper.scrape_news(max_articles_per_source=5)
+        scraper.scrape_news()
         
         # 生成HTML报告
         html_content = scraper.generate_html_report()
         logger.info("🎉 新闻日报生成完成!")
+        
+        # 保存HTML文件（用于调试）
+        with open('/tmp/news_report.html', 'w', encoding='utf-8') as f:
+            f.write(html_content)
+        logger.info("💾 HTML报告已保存到 /tmp/news_report.html")
         
         # 发送邮件
         email_sent = EmailSender.send_html_email(
@@ -539,6 +642,8 @@ def main():
             
     except Exception as e:
         logger.error(f"❌ 执行过程中出错: {e}")
+        import traceback
+        logger.error(traceback.format_exc())
         sys.exit(1)
 
 if __name__ == "__main__":
