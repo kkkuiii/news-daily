@@ -325,8 +325,7 @@ class EnhancedNewsScraper:
         category_article_counts.sort(key=lambda x: x[1], reverse=True)
         
         # HTML 模板
-        html_content = f"""
-<!DOCTYPE html>
+        html_content = f"""<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
     <meta charset="UTF-8">
@@ -483,7 +482,8 @@ class EnhancedNewsScraper:
                 for i, article in enumerate(articles, 1):
                     clean_title = article['title'].strip()
                     if len(clean_title) > 70:
-                        clean_title = clean_title[:70] + "                         
+                        clean_title = clean_title[:70] + "..."
+                    
                     html_content += f"""
             <div class="article-item">
                 <div class="article-title">{i}. <a href="{article['url']}" target="_blank">{clean_title}</a></div>
@@ -535,8 +535,7 @@ class EnhancedNewsScraper:
         </footer>
     </div>
 </body>
-</html>
-        """
+</html>"""
         
         return html_content
 
