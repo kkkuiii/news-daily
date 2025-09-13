@@ -51,10 +51,6 @@ class EnhancedNewsScraper:
             'https://www.theverge.com/rss/index.xml',
             'https://arstechnica.com/feed/',
             'https://www.engadget.com/rss.xml',
-            
-            # 综合新闻源
-            'https://rss.cnn.com/rss/edition.rss',
-            'https://feeds.bbci.co.uk/news/rss.xml',
         ]
         
         # 完整的分类配置（保持原样）
@@ -74,17 +70,20 @@ class EnhancedNewsScraper:
         self.articles_by_category = {category: [] for category in self.categories.keys()}
         self.processed_urls = set()
         
-        # 初始化 DeepSeek 客户端
-        self.deepseek_client = None
-        if deepseek_api_key:
-            try:
-                self.deepseek_client = OpenAI(
-                    api_key=deepseek_api_key,
-                    base_url="https://api.deepseek.com"
-                )
-                logger.info("✅ DeepSeek API 客户端初始化成功")
-            except Exception as e:
-                logger.error(f"❌ DeepSeek API 客户端初始化失败: {e}")
+        # 初始化 DeepSeek 客户端（强制要求）
+        if not deepseek_api_key:
+            logger.error("❌ 错误：必须提供 DeepSeek API Key！")
+            raise ValueError("DeepSeek API Key is required")
+        
+        try:
+            self.deepseek_client = OpenAI(
+                api_key=deepseek_api_key,
+                base_url="https://api.deepseek.com"
+            )
+            logger.info("✅ DeepSeek API 客户端初始化成功")
+        except Exception as e:
+            logger.error(f"❌ DeepSeek API 客户端初始化失败: {e}")
+            raise
     
     def fetch_news_from_rss(self):
         """从RSS源获取新闻"""
@@ -111,16 +110,27 @@ class EnhancedNewsScraper:
                 
                 # 处理文章条目
                 entries_processed = 0
-                for entry in feed.entries[:8]:  # 每个源最多处理8篇文章
+                for entry in feed.entries[:6]:  # 每个源最多处理6篇文章
                     try:
                         # 提取文章信息
                         title = getattr(entry, 'title', '无标题')
                         link = getattr(entry, 'link', '')
                         summary = getattr(entry, 'summary', '')
                         description = getattr(entry, 'description', '')
+                        content = getattr(entry, 'content', [{}])
                         
-                        # 合并摘要和描述
-                        content = (summary or description or '')[:300]
+                        # 合并多种内容源
+                        content_text = ""
+                        if summary:
+                            content_text = summary
+                        elif description:
+                            content_text = description
+                        elif content and isinstance(content, list) and len(content) > 0:
+                            content_text = str(content[0].get('value', ''))
+                        
+                        # 限制内容长度
+                        if len(content_text) > 400:
+                            content_text = content_text[:400] + "..."
                         
                         # 发布时间
                         pub_date = None
@@ -136,20 +146,22 @@ class EnhancedNewsScraper:
                         
                         if link and title:
                             # 分类文章
-                            is_relevant, categories = self.categorize_article(title, content)
+                            is_relevant, categories = self.categorize_article(title, content_text)
                             
-                            if is_relevant:
+                            if is_relevant and categories:
                                 article_data = {
                                     'title': title.strip(),
                                     'url': link.strip(),
-                                    'summary': content + "..." if content else "",
+                                    'summary': content_text.strip() if content_text else "暂无摘要",
                                     'publish_date': pub_date,
                                     'source': urlparse(rss_url).netloc
                                 }
                                 
                                 # 添加到对应分类
-                                for category in categories:  # 修复语法错误
-                                    self.articles_by_category[category].append(article_data)
+                                for category in categories:
+                                    # 避免重复添加
+                                    if not any(a['url'] == link for a in self.articles_by_category[category]):
+                                        self.articles_by_category[category].append(article_data)
                                 
                                 logger.info(f"🎯 获取相关文章: [{','.join(categories)}] {title[:40]}...")
                                 entries_processed += 1
@@ -189,10 +201,10 @@ class EnhancedNewsScraper:
             
             match_scores[category] = score
         
-        # 根据分数确定相关分类
+        # 根据分数确定相关分类（降低阈值提高召回率）
         for category, score in match_scores.items():
-            # 设置不同的阈值
-            threshold = 1 if any(keyword.lower() in title.lower() for keyword in self.categories[category]) else 2
+            # 更宽松的阈值
+            threshold = 1  # 降低阈值
             if score >= threshold:
                 relevant_categories.append(category)
         
@@ -227,97 +239,77 @@ class EnhancedNewsScraper:
         logger.info("📈 新闻获取完成")
     
     def generate_daily_summary(self) -> str:
-        """生成今日新闻摘要（使用完整分类）"""
-        if not self.deepseek_client:
-            return self._generate_simple_summary()
+        """生成今日新闻摘要（强制使用DeepSeek大模型）"""
+        logger.info("🤖 强制使用 DeepSeek 大模型生成智能摘要...")
+        
+        # 收集所有文章标题
+        all_titles = []
+        category_stats = {}
+        
+        for category, articles in self.articles_by_category.items():
+            if articles:
+                category_stats[category] = len(articles)
+                for article in articles[:10]:  # 每个分类最多取10篇文章
+                    all_titles.append(f"[{category}] {article['title']}")
+        
+        if not all_titles:
+            error_msg = "今日导览摘要：DeepSeek API 调用失败，暂无新闻内容可供分析。"
+            logger.error("❌ 没有文章可供分析")
+            return error_msg
+        
+        # 准备数据
+        titles_text = "\n".join(all_titles[:60])  # 最多60篇文章
+        stats_text = ", ".join([f"{cat}:{count}篇" for cat, count in category_stats.items()])
+        
+        prompt = f"""
+        请基于以下今日新闻标题，生成一段400-600字的中文摘要。要求：
+        1. 不要机械复述标题，要进行概括与串联
+        2. 提炼出当日新闻的主要趋势、关注焦点或舆论动向
+        3. 风格自然流畅，具有整体感
+        4. 突出最重要的几个主题方向
+        5. 可以适当分析各领域的发展态势
+        6. 以专业但易懂的语言表达
+        
+        今日新闻统计：{stats_text}
+        
+        新闻标题列表：
+        {titles_text}
+        
+        请以"今日导览摘要："开头，直接输出摘要内容，不要包含其他说明文字。
+        """
+        
+        logger.info(f"📊 准备发送 {len(all_titles)} 篇文章标题给 DeepSeek AI")
         
         try:
-            # 收集所有文章标题
-            all_titles = []
-            category_stats = {}
-            
-            for category, articles in self.articles_by_category.items():
-                if articles:
-                    category_stats[category] = len(articles)
-                    for article in articles[:6]:  # 每个分类最多取6篇文章
-                        all_titles.append(f"[{category}] {article['title']}")
-            
-            if not all_titles:
-                return "今日导览摘要：今日暂无相关新闻内容。"
-            
-            # 准备数据
-            titles_text = "\n".join(all_titles[:40])  # 最多40篇文章
-            stats_text = ", ".join([f"{cat}:{count}篇" for cat, count in category_stats.items()])
-            
-            prompt = f"""
-            请基于以下今日新闻标题，生成一段300-500字的中文摘要。要求：
-            1. 不要机械复述标题，要进行概括与串联
-            2. 提炼出当日新闻的主要趋势、关注焦点或舆论动向
-            3. 风格自然流畅，具有整体感
-            4. 突出最重要的几个主题方向
-            5. 可以适当分析各领域的发展态势
-            6. 以专业但易懂的语言表达
-            
-            今日新闻统计：{stats_text}
-            
-            新闻标题列表：
-            {titles_text}
-            
-            请以"今日导览摘要："开头，直接输出摘要内容，不要包含其他说明文字。
-            """
-            
-            logger.info("🤖 调用 DeepSeek 生成摘要...")
-            
             response = self.deepseek_client.chat.completions.create(
                 model="deepseek-chat",
                 messages=[
-                    {"role": "system", "content": "你是一位专业的新闻分析师和科技观察者，擅长总结和分析新闻趋势。"},
+                    {"role": "system", "content": "你是一位专业的新闻分析师和科技观察者，擅长总结和分析新闻趋势。请用中文回答。"},
                     {"role": "user", "content": prompt},
                 ],
                 stream=False,
                 temperature=0.7,
-                max_tokens=800
+                max_tokens=1000
             )
             
             summary = response.choices[0].message.content.strip()
             if not summary.startswith("今日导览摘要："):
                 summary = "今日导览摘要：" + summary
             
-            logger.info("✅ 摘要生成成功")
+            logger.info("✅ DeepSeek 大模型摘要生成成功！")
             return summary
             
         except Exception as e:
-            logger.error(f"❌ 摘要生成失败: {e}")
-            return self._generate_simple_summary()
-    
-    def _generate_simple_summary(self) -> str:
-        """生成简单摘要"""
-        # 统计分类
-        category_stats = {}
-        total_articles = 0
-        
-        for category, articles in self.articles_by_category.items():
-            if articles:
-                count = len(articles)
-                category_stats[category] = count
-                total_articles += count
-        
-        if total_articles == 0:
-            return "今日导览摘要：今日暂无相关新闻内容。"
-        
-        # 按数量排序
-        sorted_categories = sorted(category_stats.items(), key=lambda x: x[1], reverse=True)
-        main_categories = sorted_categories[:4]
-        category_text = "、".join([f"{cat}({count}篇)" for cat, count in main_categories])
-        
-        return f"今日导览摘要：今日共收录{total_articles}篇新闻，主要涉及{category_text}等领域。各领域发展态势良好，值得关注。"
+            error_msg = f"今日导览摘要：DeepSeek API 调用失败 - {str(e)}。请检查API密钥和网络连接。"
+            logger.error(f"❌ DeepSeek 大模型调用失败: {e}")
+            return error_msg
     
     def generate_html_report(self) -> str:
         """生成HTML格式的日报"""
         current_date = datetime.now().strftime("%Y-%m-%d")
         current_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
         
-        # 生成摘要
+        # 生成摘要（强制使用DeepSeek）
         daily_summary = self.generate_daily_summary()
         
         # 按文章数量排序分类
@@ -420,6 +412,10 @@ class EnhancedNewsScraper:
             color: #555;
             margin: 12px 0 0 0;
             line-height: 1.6;
+            background-color: #fafafa;
+            padding: 12px;
+            border-radius: 4px;
+            border-left: 3px solid #3498db;
         }}
         .stats {{
             background-color: #e8f4f8;
@@ -498,8 +494,16 @@ class EnhancedNewsScraper:
                     else:
                         html_content += f'<div class="article-meta">📰 来源: {article["source"]}</div>\n'
                     
-                    if article.get('summary') and len(article['summary']) > 15:
-                        html_content += f'<div class="article-summary">📝 摘要: {article["summary"]}</div>\n'
+                    # 显示摘要（确保摘要不为空）
+                    summary_text = article.get('summary', '').strip()
+                    if summary_text and summary_text != "暂无摘要" and len(summary_text) > 10:
+                        # 清理HTML标签
+                        clean_summary = re.sub('<[^<]+?>', '', summary_text)
+                        if len(clean_summary) > 200:
+                            clean_summary = clean_summary[:200] + "..."
+                        html_content += f'<div class="article-summary">📝 {clean_summary}</div>\n'
+                    elif summary_text == "暂无摘要":
+                        html_content += f'<div class="article-summary">📝 暂无摘要</div>\n'
                     
                     html_content += '            </div>\n'
                 
@@ -531,7 +535,7 @@ class EnhancedNewsScraper:
         </div>
         
         <footer>
-            <p>📊 新闻日报自动生成 | 🕐 生成时间: """ + current_time + """ | 🤖 Powered by DeepSeek AI</p>
+            <p>📊 新闻日报自动生成 | 🕐 生成时间: """ + current_time + """ | 🤖 Powered by DeepSeek AI 大模型</p>
         </footer>
     </div>
 </body>
@@ -593,7 +597,8 @@ def main():
     
     # 验证必要配置
     if not DEEPSEEK_API_KEY:
-        logger.error("❌ 请设置 DEEPSEEK_API_KEY 环境变量")
+        logger.error("❌ 错误：必须设置 DEEPSEEK_API_KEY 环境变量！")
+        logger.error("请在 GitHub Secrets 中添加 DEEPSEEK_API_KEY")
         sys.exit(1)
     
     if not all([SENDER_EMAIL, SENDER_PASSWORD, RECEIVER_EMAIL]):
@@ -609,14 +614,22 @@ def main():
     })
     
     try:
-        # 创建新闻抓取器
+        # 创建新闻抓取器（强制使用DeepSeek）
+        logger.info("🔧 初始化 DeepSeek 大模型客户端...")
         scraper = EnhancedNewsScraper(deepseek_api_key=DEEPSEEK_API_KEY)
         
         # 开始抓取新闻
         logger.info("🌐 开始抓取新闻...")
         scraper.scrape_news()
         
-        # 生成HTML报告
+        # 显示统计信息
+        total_articles = sum(len(articles) for articles in scraper.articles_by_category.values())
+        logger.info(f"📊 抓取统计 - 总文章数: {total_articles}")
+        for category, articles in scraper.articles_by_category.items():
+            if articles:
+                logger.info(f"   📂 {category}: {len(articles)}篇")
+        
+        # 生成HTML报告（强制使用DeepSeek生成摘要）
         html_content = scraper.generate_html_report()
         logger.info("🎉 新闻日报生成完成!")
         
@@ -628,7 +641,7 @@ def main():
         # 发送邮件
         email_sent = EmailSender.send_html_email(
             html_content=html_content,
-            subject=f"每日新闻导览-{datetime.now().strftime('%Y-%m-%d')}",
+            subject=f"每日新闻导览-{datetime.now().strftime('%Y-%m-%d')} - DeepSeek AI 生成",
             config=EMAIL_CONFIG
         )
         
